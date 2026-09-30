@@ -30,6 +30,10 @@ def add_indicators(df, kdj_n=9, atr_n=14, confirm_n=5, vol_mult=1.2, sell_need_v
 
     tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     df["ATR"] = tr.ewm(alpha=1 / atr_n, adjust=False).mean()
+    df["BB_MID"] = c.rolling(20).mean()
+    bb_std = c.rolling(20).std()
+    df["BB_UP"] = df["BB_MID"] + 2 * bb_std
+    df["BB_LOW"] = df["BB_MID"] - 2 * bb_std
     df["MA50"] = c.rolling(50).mean()
     df["MA200"] = c.rolling(200).mean()
 
@@ -137,6 +141,71 @@ def run_all(raw, start, cost, atr_init, atr_trail, capital=10000.0,
         eq, tr, ex = backtest(df, k, cost, atr_init, atr_trail, capital)
         res[k] = {"eq": eq, "trades": tr, "m": metrics(eq, tr, ex)}
     return df, res
+
+
+# ---------------- K線 + 布林 + 成交量 + MACD + KDJ ----------------
+UP, DOWN = "#16a34a", "#dc2626"  # 美股慣例: 綠漲紅跌
+
+
+def kline_chart(df, tr, name, show_bb=True, show_ma=True, days="近6個月"):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                        row_heights=[0.5, 0.14, 0.18, 0.18],
+                        subplot_titles=(f"{name} 日K", "成交量", "MACD (12,26,9)", "KDJ (9,3,3)"))
+    # 主圖
+    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+                                 increasing_line_color=UP, decreasing_line_color=DOWN,
+                                 increasing_fillcolor=UP, decreasing_fillcolor=DOWN, name="K線"), 1, 1)
+    if show_bb:
+        fig.add_trace(go.Scatter(x=df.index, y=df["BB_UP"], name="布林上軌",
+                                 line=dict(width=1, color="#8b5cf6")), 1, 1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["BB_LOW"], name="布林下軌", fill="tonexty",
+                                 fillcolor="rgba(139,92,246,0.08)", line=dict(width=1, color="#8b5cf6")), 1, 1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["BB_MID"], name="布林中軌(MA20)",
+                                 line=dict(width=1, color="#8b5cf6", dash="dot")), 1, 1)
+    if show_ma:
+        fig.add_trace(go.Scatter(x=df.index, y=df["MA50"], name="MA50", line=dict(width=1.2, color="#0ea5e9")), 1, 1)
+        fig.add_trace(go.Scatter(x=df.index, y=df["MA200"], name="MA200", line=dict(width=1.2, color="#f97316")), 1, 1)
+    if len(tr):
+        fig.add_trace(go.Scatter(x=tr["進場日"], y=tr["進場價"], mode="markers", name="買",
+                                 marker=dict(symbol="triangle-up", size=12, color="#2563eb",
+                                             line=dict(width=1, color="white"))), 1, 1)
+        fig.add_trace(go.Scatter(x=tr["出場日"], y=tr["出場價"], mode="markers", name="賣",
+                                 marker=dict(symbol="triangle-down", size=12, color="#f59e0b",
+                                             line=dict(width=1, color="white"))), 1, 1)
+    # 成交量
+    vcol = np.where(df["Close"] >= df["Open"], UP, DOWN)
+    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=vcol, name="成交量", showlegend=False), 2, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["VOL_MA20"], name="20日均量",
+                             line=dict(width=1, color="#6b7280")), 2, 1)
+    # MACD
+    hcol = np.where(df["HIST"] >= 0, UP, DOWN)
+    fig.add_trace(go.Bar(x=df.index, y=df["HIST"], marker_color=hcol, name="MACD柱", showlegend=False), 3, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["DIF"], name="DIF", line=dict(width=1.2, color="#2563eb")), 3, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["DEA"], name="DEA", line=dict(width=1.2, color="#f59e0b")), 3, 1)
+    # KDJ
+    fig.add_trace(go.Scatter(x=df.index, y=df["K"], name="K", line=dict(width=1.2, color="#2563eb")), 4, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["D"], name="D", line=dict(width=1.2, color="#f59e0b")), 4, 1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["J"], name="J", line=dict(width=1, color="#a855f7")), 4, 1)
+    for lvl in (20, 80):
+        fig.add_hline(y=lvl, line=dict(width=1, dash="dot", color="#9ca3af"), row=4, col=1)
+
+    if days != "全部":
+        n = 126 if days == "近6個月" else 252
+        start = df.index[max(0, len(df) - n)]
+        fig.update_xaxes(range=[start, df.index[-1] + pd.Timedelta(days=3)])
+        seg = df[df.index >= start]
+        lo = seg[["Low", "BB_LOW"]].min().min() if show_bb else seg["Low"].min()
+        hi = seg[["High", "BB_UP"]].max().max() if show_bb else seg["High"].max()
+        fig.update_yaxes(range=[lo * 0.97, hi * 1.03], row=1, col=1)
+        fig.update_yaxes(range=[0, seg["Volume"].max() * 1.1], row=2, col=1)
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    fig.update_layout(height=900, xaxis_rangeslider_visible=False, hovermode="x unified",
+                      legend=dict(orientation="h", y=1.04, x=0), margin=dict(t=60, l=10, r=10, b=10),
+                      bargap=0.1)
+    return fig
 
 
 # ---------------- 高成交量選股 ----------------
@@ -320,17 +389,11 @@ def main():
 
     sk = st.radio("顯示買賣點", ["A", "B", "C", "D"], format_func=lambda k: STRATS[k], horizontal=True)
     tr = res[sk]["trades"]
-    k = go.Figure(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-                                 increasing_line_color="#16a34a", decreasing_line_color="#dc2626", name=pick))
-    k.add_trace(go.Scatter(x=df.index, y=df["MA50"], name="MA50", line=dict(width=1)))
-    k.add_trace(go.Scatter(x=df.index, y=df["MA200"], name="MA200", line=dict(width=1)))
-    if len(tr):
-        k.add_trace(go.Scatter(x=tr["進場日"], y=tr["進場價"], mode="markers", name="買",
-                               marker=dict(symbol="triangle-up", size=10, color="#2563eb")))
-        k.add_trace(go.Scatter(x=tr["出場日"], y=tr["出場價"], mode="markers", name="賣",
-                               marker=dict(symbol="triangle-down", size=10, color="#f59e0b")))
-    k.update_layout(height=520, xaxis_rangeslider_visible=False)
-    st.plotly_chart(k, use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    show_bb = c1.checkbox("布林通道", True)
+    show_ma = c2.checkbox("MA50 / MA200", True)
+    days = c3.selectbox("顯示區間", ["近6個月", "近1年", "全部"], index=0)
+    st.plotly_chart(kline_chart(df, tr, pick, show_bb, show_ma, days), use_container_width=True)
 
     with st.expander("交易明細"):
         st.dataframe(tr.style.format(precision=2), use_container_width=True, hide_index=True)
