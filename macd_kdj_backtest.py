@@ -162,24 +162,26 @@ def main():
         sell_need_vol = st.checkbox("賣出也要帶量", False)
         go_btn = st.button("開始回測", type="primary")
 
-    if not go_btn:
+    if go_btn:
+        fetch_from = pd.Timestamp(start) - pd.Timedelta(days=450)  # 預留 MA200 暖機
+        rows, all_res = [], {}
+        for t in [x.strip().upper() for x in tickers.split(",") if x.strip()]:
+            raw = yf.Ticker(t).history(start=fetch_from, auto_adjust=True)
+            if raw.empty or len(raw) < 300:
+                st.warning(f"{t}: 資料不足，已略過")
+                continue
+            raw.index = raw.index.tz_localize(None)
+            df, res = run_all(raw[["Open", "High", "Low", "Close", "Volume"]], start, cost, atr_init, atr_trail,
+                              capital, confirm_n, vol_mult, sell_need_vol)
+            all_res[t] = (df, res)
+            for k, v in res.items():
+                rows.append({"代號": t, "策略": STRATS[k], **v["m"]})
+        st.session_state["bt"] = (rows, all_res, capital)
+
+    if "bt" not in st.session_state:
         st.info("在左側輸入股票代號後按「開始回測」。")
         return
-
-    fetch_from = pd.Timestamp(start) - pd.Timedelta(days=450)  # 預留 MA200 暖機
-    rows, all_res = [], {}
-    for t in [x.strip().upper() for x in tickers.split(",") if x.strip()]:
-        raw = yf.Ticker(t).history(start=fetch_from, auto_adjust=True)
-        if raw.empty or len(raw) < 300:
-            st.warning(f"{t}: 資料不足，已略過")
-            continue
-        raw.index = raw.index.tz_localize(None)
-        df, res = run_all(raw[["Open", "High", "Low", "Close", "Volume"]], start, cost, atr_init, atr_trail,
-                          capital, confirm_n, vol_mult, sell_need_vol)
-        all_res[t] = (df, res)
-        for k, v in res.items():
-            rows.append({"代號": t, "策略": STRATS[k], **v["m"]})
-
+    rows, all_res, capital = st.session_state["bt"]
     if not rows:
         return
     summary = pd.DataFrame(rows)
@@ -189,10 +191,6 @@ def main():
     st.subheader("各策略平均 (跨所有股票)")
     avg = summary.groupby("策略", sort=False).mean(numeric_only=True)
     st.dataframe(avg.style.format(precision=2), use_container_width=True)
-
-    st.subheader("所有股票合計損益 (美元)")
-    tot = summary.groupby("策略", sort=False)[["損益$"]].sum()
-    st.dataframe(tot.style.format("{:,.0f}"), use_container_width=True)
 
     st.subheader("單檔細看")
     pick = st.selectbox("選擇股票", list(all_res))
@@ -220,6 +218,21 @@ def main():
 
     with st.expander("交易明細"):
         st.dataframe(tr.style.format(precision=2), use_container_width=True, hide_index=True)
+
+    # ---------- 最下方: 最終損益加總 ----------
+    st.divider()
+    n = len(all_res)
+    invested = capital * n
+    st.subheader("最終損益加總")
+    st.caption(f"共 {n} 檔股票，每檔起始 ${capital:,.0f}，總投入 ${invested:,.0f}")
+    tot = summary.groupby("策略", sort=False).agg(**{"期末資金$": ("期末資金$", "sum"),
+                                                     "損益$": ("損益$", "sum"),
+                                                     "交易次數": ("交易次數", "sum")})
+    cols = st.columns(len(tot))
+    for col, (name, r) in zip(cols, tot.iterrows()):
+        pct = r["損益$"] / invested * 100
+        col.metric(name, f"${r['損益$']:,.0f}", f"{pct:+.1f}%")
+        col.caption(f"期末 ${r['期末資金$']:,.0f}｜交易 {int(r['交易次數'])} 次")
 
 
 if __name__ == "__main__":
