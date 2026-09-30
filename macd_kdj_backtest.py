@@ -139,6 +139,118 @@ def run_all(raw, start, cost, atr_init, atr_trail, capital=10000.0,
     return df, res
 
 
+# ---------------- 高成交量選股 ----------------
+DEFAULT_UNIVERSE = """
+AAPL MSFT NVDA AMZN META GOOGL TSLA AMD AVGO NFLX INTC MU QCOM TXN ARM SMCI MRVL ON
+PLTR SOFI HOOD COIN RIVN LCID NIO XPEV LI F GM UBER LYFT SNAP PINS RBLX U DKNG
+PYPL SQ AFRM UPST SHOP BABA JD PDD BIDU CSCO ORCL CRM ADBE IBM DELL HPQ HPE WBD
+T VZ CMCSA DIS KO PEP WMT TGT COST NKE SBUX MCD CVS WBA PFE MRK BMY ABBV JNJ
+GILD MRNA BAC WFC C JPM GS MS SCHW KEY RF HBAN USB XOM CVX OXY SLB HAL DVN
+BP KMI AAL DAL UAL CCL NCLH RCL BA GE CAT FCX NEM KGC GOLD AA CLF X VALE
+MARA RIOT CLSK IONQ RKLB SOUN BBAI ACHR JOBY LUMN PLUG CHPT RUN ENPH
+SPY QQQ IWM SOXL TQQQ SQQQ TLT XLF XLE
+"""
+
+
+def screener_page(st, yf):
+    st.title("高成交量選股")
+    st.caption("找出成交量大、股價在預算內的股票，並顯示策略 D 目前的訊號狀態。僅供研究與教學，不構成投資建議。")
+
+    with st.sidebar:
+        src = st.radio("股票池", ["內建熱門股 (約140檔)", "Yahoo 今日最活躍", "自己輸入"])
+        custom = st.text_area("自己輸入代號 (空格或逗號分隔)", "", disabled=src != "自己輸入")
+        pmin, pmax = st.slider("股價範圍 (美元)", 1, 1000, (5, 100))
+        min_vol = st.number_input("20日均量至少 (萬股)", 0, 100000, 500, 100)
+        min_dv = st.number_input("20日均成交額至少 (百萬美元)", 0, 100000, 50, 10)
+        top_n = st.number_input("最多列出幾檔", 5, 200, 30, 5)
+        confirm_n = st.number_input("策略D: KDJ 交叉後幾天內等 MACD", 1, 20, 5, 1)
+        vol_mult = st.number_input("策略D: 帶量倍數", 1.0, 3.0, 1.2, 0.1)
+        only_up = st.checkbox("只看多頭排列 (收盤>MA50>MA200)", False)
+        run = st.button("開始篩選", type="primary")
+
+    if run:
+        if src.startswith("Yahoo"):
+            try:
+                q = yf.screen("most_actives", count=200)
+                universe = [x["symbol"] for x in q.get("quotes", [])]
+            except Exception as e:
+                st.error(f"抓不到 Yahoo 最活躍清單: {e}，改用內建清單")
+                universe = DEFAULT_UNIVERSE.split()
+        elif src == "自己輸入":
+            universe = custom.replace(",", " ").upper().split()
+        else:
+            universe = DEFAULT_UNIVERSE.split()
+        universe = list(dict.fromkeys(universe))
+        if not universe:
+            st.warning("股票池是空的")
+            return
+
+        with st.spinner(f"下載 {len(universe)} 檔股票資料中…"):
+            data = yf.download(universe, period="14mo", group_by="ticker", auto_adjust=True,
+                               progress=False, threads=True)
+        rows = []
+        for t in universe:
+            try:
+                d = data[t] if len(universe) > 1 else data
+                d = d[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                if len(d) < 210:
+                    continue
+                d = add_indicators(d.copy(), confirm_n=confirm_n, vol_mult=vol_mult)
+                r = d.iloc[-1]
+                avg_v = d["Volume"].tail(20).mean()
+                avg_dv = (d["Close"] * d["Volume"]).tail(20).mean()
+                if r["D_BUY"]:
+                    sig = "今日買進訊號"
+                elif r["D_SELL"]:
+                    sig = "今日賣出訊號"
+                elif d["KDJ_GOLD"].tail(confirm_n).any() and not d["MACD_GOLD"].tail(confirm_n).any():
+                    sig = "KDJ已金叉，等MACD確認"
+                else:
+                    sig = ""
+                rows.append({"代號": t, "收盤價": r["Close"],
+                             "20日均量(萬股)": avg_v / 1e4, "20日均成交額(百萬$)": avg_dv / 1e6,
+                             "今日量比": r["Volume"] / r["VOL_MA20"] if r["VOL_MA20"] else np.nan,
+                             "多頭排列": bool(r["Close"] > r["MA50"] > r["MA200"]),
+                             "策略D訊號": sig, "資料日期": d.index[-1].date()})
+            except Exception:
+                continue
+        st.session_state["scr"] = pd.DataFrame(rows)
+        st.session_state["scr_filters"] = (pmin, pmax, min_vol, min_dv, top_n, only_up)
+
+    if "scr" not in st.session_state:
+        st.info("在左側設定條件後按「開始篩選」。")
+        return
+    df = st.session_state["scr"]
+    if df.empty:
+        st.warning("沒有抓到任何資料，請稍後再試。")
+        return
+    pmin, pmax, min_vol, min_dv, top_n, only_up = st.session_state["scr_filters"]
+    f = df[(df["收盤價"] >= pmin) & (df["收盤價"] <= pmax)
+           & (df["20日均量(萬股)"] >= min_vol) & (df["20日均成交額(百萬$)"] >= min_dv)]
+    if only_up:
+        f = f[f["多頭排列"]]
+    f = f.sort_values("20日均成交額(百萬$)", ascending=False).head(int(top_n))
+
+    st.subheader(f"符合條件: {len(f)} 檔 (共檢查 {len(df)} 檔)")
+    st.dataframe(f.style.format({"收盤價": "{:.2f}", "20日均量(萬股)": "{:,.0f}",
+                                 "20日均成交額(百萬$)": "{:,.0f}", "今日量比": "{:.2f}"}),
+                 use_container_width=True, hide_index=True)
+
+    hot = f[f["策略D訊號"] != ""]
+    if len(hot):
+        st.subheader("策略 D 有動靜的股票")
+        st.dataframe(hot[["代號", "收盤價", "今日量比", "策略D訊號"]].style.format(precision=2),
+                     use_container_width=True, hide_index=True)
+
+    if len(f):
+        tick = " ".join(f["代號"])
+        st.subheader("複製使用")
+        st.caption("貼到「策略回測」的股票代號欄 (先驗證策略 D 在這些股票上的表現)")
+        st.code(", ".join(f["代號"]), language=None)
+        st.caption("貼到終端機執行自動下單程式")
+        st.code(f".venv/bin/python ibkr_auto_trader.py {tick}", language=None)
+
+
 # ---------------- 介面 ----------------
 def main():
     import streamlit as st
@@ -146,6 +258,10 @@ def main():
     import plotly.graph_objects as go
 
     st.set_page_config(page_title="MACD+KDJ 短線回測", layout="wide")
+    mode = st.sidebar.radio("功能", ["策略回測", "高成交量選股"], horizontal=True)
+    if mode == "高成交量選股":
+        screener_page(st, yf)
+        return
     st.title("MACD + KDJ 短線策略回測")
     st.caption("日線、只做多、收盤確認訊號、隔日開盤成交。僅供研究與教學，不構成投資建議。")
 
