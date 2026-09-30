@@ -48,6 +48,34 @@ def add_indicators(df, kdj_n=9, atr_n=14, confirm_n=5, vol_mult=1.2, sell_need_v
     df["D_BUY"] = kg_recent & df["MACD_GOLD"] & df["VOL_OK"]
     df["D_SELL"] = kd_recent & df["MACD_DEAD"] & (df["VOL_OK"] if sell_need_vol else True)
     df["TREND_OK"] = (c > df["MA50"]) & (df["MA50"] > df["MA200"]) & (df["DIF"] > 0)
+
+    # --- VCP + ATR (簡化版) ---
+    df["MA150"] = c.rolling(150).mean()
+    df["MA200_UP"] = df["MA200"] > df["MA200"].shift(22)
+    df["HI52"] = h.rolling(252, min_periods=200).max()
+    df["LO52"] = l.rolling(252, min_periods=200).min()
+    df["ATR10"] = tr.ewm(alpha=1 / 10, adjust=False).mean()
+    df["ATR50"] = tr.ewm(alpha=1 / 50, adjust=False).mean()
+    df["HH20"] = h.rolling(20).max().shift()
+    df["RANGE15"] = (h.rolling(15).max() - l.rolling(15).min()) / c
+    df["TT7"] = ((c > df["MA150"]) & (c > df["MA200"]) & (df["MA150"] > df["MA200"]) & df["MA200_UP"]
+                 & (df["MA50"] > df["MA150"]) & (c > df["MA50"])
+                 & (c >= 1.3 * df["LO52"]) & (c >= 0.75 * df["HI52"]))
+    # 波動收縮: 突破前 10 天內 ATR10/ATR50 曾低於 0.85，且前一天 15 日振幅 < 15%
+    squeeze = (df["ATR10"] / df["ATR50"]).shift().rolling(10).min() < 0.85
+    tight = squeeze & (df["RANGE15"].shift() < 0.15)
+    df["V_BUY"] = (df["TT7"].shift(fill_value=False) & tight
+                   & (c > df["HH20"]) & (df["Volume"] > 1.4 * df["VOL_MA20"]))
+
+    # --- ADX(14) 趨勢強度 ---
+    up, dn = h.diff(), -l.diff()
+    pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=df.index)
+    mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=df.index)
+    atr14 = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    pdi = 100 * pdm.ewm(alpha=1 / 14, adjust=False).mean() / atr14
+    mdi = 100 * mdm.ewm(alpha=1 / 14, adjust=False).mean() / atr14
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    df["ADX"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
     return df
 
 
@@ -66,7 +94,7 @@ def backtest(df, strategy, cost=0.001, atr_init=2.0, atr_trail=3.0, capital=1000
             cost_basis = cash
             shares = cash * (1 - cost) / o[i]
             cash, entry_px, entry_date = 0.0, o[i], df.index[i]
-            if strategy == "C":
+            if strategy in ("C", "V"):
                 stop = o[i] - atr_init * df["ATR"].iat[i - 1]
         elif pending == "sell" and shares > 0:
             cash = shares * o[i] * (1 - cost)
@@ -96,6 +124,8 @@ def backtest(df, strategy, cost=0.001, atr_init=2.0, atr_trail=3.0, capital=1000
             entry = r["KDJ_GOLD"] and r["DIF"] > r["DEA"]
             if strategy in ("B", "C"):
                 entry = entry and r["TREND_OK"]
+            if strategy == "V":
+                entry = bool(r["V_BUY"])
             if entry:
                 pending = "buy"
         else:
@@ -104,7 +134,7 @@ def backtest(df, strategy, cost=0.001, atr_init=2.0, atr_trail=3.0, capital=1000
                     pending = "sell"
             else:  # C
                 stop = max(stop, c[i] - atr_trail * r["ATR"])
-                if c[i] < stop or r["MACD_DEAD"]:
+                if c[i] < stop or (strategy == "C" and r["MACD_DEAD"]):
                     pending = "sell"
 
     eq = pd.Series(equity, index=df.index)
@@ -129,7 +159,8 @@ def metrics(eq, trades, exposure):
     return out
 
 
-STRATS = {"BH": "買進持有", "A": "A 純MACD+KDJ", "B": "B 加趨勢過濾", "C": "C 加ATR停損", "D": "D 二次確認帶量"}
+STRATS = {"BH": "買進持有", "A": "A 純MACD+KDJ", "B": "B 加趨勢過濾", "C": "C 加ATR停損", "D": "D 二次確認帶量",
+          "V": "V VCP+ATR(簡化)"}
 
 
 def run_all(raw, start, cost, atr_init, atr_trail, capital=10000.0,
@@ -320,6 +351,172 @@ def screener_page(st, yf):
         st.code(f".venv/bin/python ibkr_auto_trader.py {tick}", language=None)
 
 
+# ---------------- 策略適配分類 ----------------
+def efficiency_ratio(c, n=120):
+    seg = c.tail(n + 1)
+    move = abs(seg.iloc[-1] - seg.iloc[0])
+    path = seg.diff().abs().sum()
+    return move / path if path else np.nan
+
+
+def classify_shape(tt, er, adx, atrp):
+    if atrp < 1.5:
+        return "波動太小"
+    if atrp > 6:
+        return "波動過大"
+    if tt >= 7:
+        return "趨勢領頭型 → VCP+ATR"
+    if tt <= 5 and er < 0.15 and adx < 25 and atrp >= 2:
+        return "規律擺盪型 → MACD+KDJ"
+    return "混合型"
+
+
+def classify_bt(d_ret, d_n, v_ret, v_n):
+    # VCP 突破本來就少見，門檻設 2 筆；MACD+KDJ 訊號多，門檻 3 筆
+    d_ok, v_ok = d_n >= 3, v_n >= 2
+    if not d_ok and not v_ok:
+        return "樣本不足"
+    if d_ok and v_ok:
+        if d_ret <= 0 and v_ret <= 0:
+            return "兩者都虧"
+        return "MACD+KDJ 較佳" if d_ret > v_ret else "VCP+ATR 較佳"
+    if d_ok:
+        return "MACD+KDJ 較佳" if d_ret > 0 else "兩者都虧"
+    return "VCP+ATR 較佳" if v_ret > 0 else "兩者都虧"
+
+
+def final_call(shape, bt):
+    if "VCP" in shape and bt == "VCP+ATR 較佳":
+        return "✅ VCP+ATR"
+    if "MACD" in shape and bt == "MACD+KDJ 較佳":
+        return "✅ MACD+KDJ"
+    if bt in ("VCP+ATR 較佳", "MACD+KDJ 較佳"):
+        return "△ " + bt.replace(" 較佳", "") + " (型態不一致)"
+    if "→" in shape:
+        return "△ " + shape.split("→ ")[1] + " (回測未證實)"
+    return "✕ 暫不適用"
+
+
+def strategy_fit_page(st, yf):
+    st.title("策略適配分類")
+    st.caption("判斷每檔股票比較適合 MACD+KDJ 二次確認，還是 VCP+ATR。"
+               "同時看「股性型態」和「實際回測」，兩者一致才打 ✅。僅供研究與教學，不構成投資建議。")
+
+    with st.sidebar:
+        src = st.radio("股票池", ["內建熱門股 (約140檔)", "自己輸入"])
+        custom = st.text_area("自己輸入代號 (空格或逗號分隔)", "", disabled=src != "自己輸入")
+        years = st.number_input("回測最近幾年", 1, 10, 5, 1)
+        cost = st.number_input("單邊成本 %", 0.0, 1.0, 0.10, 0.05) / 100
+        confirm_n = st.number_input("MACD+KDJ: KDJ 交叉後幾天內等 MACD", 1, 20, 5, 1)
+        vol_mult = st.number_input("MACD+KDJ: 帶量倍數", 1.0, 3.0, 1.2, 0.1)
+        atr_init = st.number_input("VCP: 初始停損 ATR 倍數", 0.5, 5.0, 2.0, 0.5)
+        atr_trail = st.number_input("VCP: 移動停損 ATR 倍數", 0.5, 6.0, 3.0, 0.5)
+        run = st.button("開始分類", type="primary")
+
+    with st.expander("判斷規則說明"):
+        st.markdown("""
+**股性型態**（看最近約半年）
+- 趨勢效率 ER：淨漲跌幅 ÷ 每日漲跌絕對值加總。越接近 1 代表走得越直，越接近 0 代表來回震盪。
+- ADX：大於 25 代表趨勢明確。
+- ATR%：每日平均波動占股價比例。
+- 趨勢模板：Minervini 8 條，RS 以本次股票池內的相對強度排名計算。
+- 趨勢模板 ≥ 7 → 趨勢領頭型，適合 VCP+ATR（整理打底期間 ER 本來就低，所以不看 ER）
+- 趨勢模板 ≤ 5、ER < 0.15、ADX < 25、ATR% ≥ 2 → 規律擺盪型，適合 MACD+KDJ
+- ATR% < 1.5 太小，短線不划算；ATR% > 6 波動過大
+
+**實際回測**：同一期間分別跑兩個策略。MACD+KDJ 至少 3 筆、VCP+ATR 至少 2 筆才列入比較（VCP 突破本來就少，所以預設回測 5 年）。
+
+**VCP+ATR 為簡化版**：前一天通過趨勢模板前 7 條，且波動收縮（突破前 10 天內 ATR10/ATR50 曾 < 0.85、前一天 15 日振幅 < 15%），
+當天收盤突破 20 日高點並帶量 1.4 倍進場；初始停損與移動停損都用 ATR 倍數。
+真正的 VCP 還要看收縮次數與形態，請再用你的 VCP 工具人工確認。
+
+這些門檻是經驗值，不是定律，可以依你的觀察調整。
+""")
+
+    if run:
+        universe = (custom.replace(",", " ").upper().split() if src == "自己輸入"
+                    else DEFAULT_UNIVERSE.split())
+        universe = list(dict.fromkeys(universe))
+        if not universe:
+            st.warning("股票池是空的")
+            return
+        with st.spinner(f"下載 {len(universe)} 檔、{years + 2} 年資料中…"):
+            data = yf.download(universe, period=f"{int(years) + 2}y", group_by="ticker",
+                               auto_adjust=True, progress=False, threads=True)
+        frames = {}
+        for t in universe:
+            try:
+                d = data[t] if len(universe) > 1 else data
+                d = d[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                if len(d) >= 300:
+                    frames[t] = d
+            except Exception:
+                continue
+        # RS 排名 (IBD 風格加權報酬)
+        rs_raw = {}
+        for t, d in frames.items():
+            c = d["Close"]
+            rs_raw[t] = sum(w * (c.iloc[-1] / c.iloc[-1 - n] - 1)
+                            for w, n in ((0.4, 63), (0.2, 126), (0.2, 189), (0.2, 252)))
+        rs_rank = pd.Series(rs_raw).rank(pct=True) * 99
+
+        rows, prog = [], st.progress(0.0)
+        for j, (t, d) in enumerate(frames.items()):
+            prog.progress((j + 1) / len(frames))
+            try:
+                d = add_indicators(d.copy(), confirm_n=confirm_n, vol_mult=vol_mult)
+                r = d.iloc[-1]
+                tt = int(sum([r["Close"] > r["MA150"] and r["Close"] > r["MA200"], r["MA150"] > r["MA200"],
+                              bool(r["MA200_UP"]), r["MA50"] > r["MA150"] and r["MA50"] > r["MA200"],
+                              r["Close"] > r["MA50"], r["Close"] >= 1.3 * r["LO52"],
+                              r["Close"] >= 0.75 * r["HI52"], rs_rank[t] >= 70]))
+                er = efficiency_ratio(d["Close"])
+                atrp = r["ATR"] / r["Close"] * 100
+                start = d.index[-1] - pd.DateOffset(years=int(years))
+                w = d[d.index >= start]
+                eq_d, tr_d, _ = backtest(w, "D", cost, atr_init, atr_trail, 1.0)
+                eq_v, tr_v, _ = backtest(w, "V", cost, atr_init, atr_trail, 1.0)
+                d_ret, v_ret = (eq_d.iloc[-1] - 1) * 100, (eq_v.iloc[-1] - 1) * 100
+                shape = classify_shape(tt, er, r["ADX"], atrp)
+                bt = classify_bt(d_ret, len(tr_d), v_ret, len(tr_v))
+                rows.append({"代號": t, "綜合建議": final_call(shape, bt), "股性型態": shape, "回測判定": bt,
+                             "收盤價": r["Close"], "趨勢模板(/8)": tt, "RS": rs_rank[t], "ER": er,
+                             "ADX": r["ADX"], "ATR%": atrp,
+                             "MACD+KDJ報酬%": d_ret, "MACD+KDJ次數": len(tr_d),
+                             "VCP+ATR報酬%": v_ret, "VCP+ATR次數": len(tr_v)})
+            except Exception:
+                continue
+        prog.empty()
+        st.session_state["fit"] = pd.DataFrame(rows)
+
+    if "fit" not in st.session_state:
+        st.info("在左側設定後按「開始分類」。")
+        return
+    df = st.session_state["fit"]
+    if df.empty:
+        st.warning("沒有抓到任何資料，請稍後再試。")
+        return
+    if len(df) < 20:
+        st.warning("股票池少於 20 檔，RS 排名的參考性較低。")
+
+    fmt = {"收盤價": "{:.2f}", "RS": "{:.0f}", "ER": "{:.2f}", "ADX": "{:.1f}", "ATR%": "{:.2f}",
+           "MACD+KDJ報酬%": "{:.1f}", "VCP+ATR報酬%": "{:.1f}"}
+    order = {"✅": 0, "△": 1, "✕": 2}
+    df = df.assign(_o=df["綜合建議"].str[0].map(order)).sort_values(["_o", "綜合建議"]).drop(columns="_o")
+
+    for label, key in (("適合 MACD+KDJ 二次確認", "MACD+KDJ"), ("適合 VCP+ATR", "VCP+ATR")):
+        sub = df[df["綜合建議"] == f"✅ {key}"]
+        st.subheader(f"{label}：{len(sub)} 檔")
+        if len(sub):
+            st.dataframe(sub.style.format(fmt), use_container_width=True, hide_index=True)
+            st.code(", ".join(sub["代號"]), language=None)
+        else:
+            st.caption("目前沒有兩項判斷都一致的股票。")
+
+    with st.expander(f"全部結果 ({len(df)} 檔，含 △ 待觀察與 ✕ 不適用)"):
+        st.dataframe(df.style.format(fmt), use_container_width=True, hide_index=True)
+
+
 # ---------------- 介面 ----------------
 def main():
     import streamlit as st
@@ -327,7 +524,10 @@ def main():
     import plotly.graph_objects as go
 
     st.set_page_config(page_title="MACD+KDJ 短線回測", layout="wide")
-    mode = st.sidebar.radio("功能", ["策略回測", "高成交量選股"], horizontal=True)
+    mode = st.sidebar.radio("功能", ["策略回測", "高成交量選股", "策略適配分類"])
+    if mode == "策略適配分類":
+        strategy_fit_page(st, yf)
+        return
     if mode == "高成交量選股":
         screener_page(st, yf)
         return
@@ -387,7 +587,7 @@ def main():
     fig.update_layout(title=f"{pick} 資金曲線 (美元)", height=420, hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
-    sk = st.radio("顯示買賣點", ["A", "B", "C", "D"], format_func=lambda k: STRATS[k], horizontal=True)
+    sk = st.radio("顯示買賣點", ["A", "B", "C", "D", "V"], format_func=lambda k: STRATS[k], horizontal=True)
     tr = res[sk]["trades"]
     c1, c2, c3 = st.columns(3)
     show_bb = c1.checkbox("布林通道", True)
