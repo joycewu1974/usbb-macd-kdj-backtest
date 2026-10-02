@@ -521,10 +521,10 @@ def strategy_fit_page(st, yf):
 SP500_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
 LAB_STRATS = ["BH", "A", "B", "C", "D", "V"]
 LAB_NAME = {"BH": "買進持有", "A": "A 純MACD+KDJ", "B": "B 趨勢過濾", "C": "C ATR停損",
-            "D": "D 二次確認", "V": "V VCP+ATR"}
+            "D": "D 二次確認", "V": "V VCP+ATR", "NONE": "不交易"}
 
 
-def fast_backtest(df, strategy, cost=0.001, atr_init=2.0, atr_trail=3.0):
+def fast_backtest(df, strategy, cost=0.001, atr_init=2.0, atr_trail=3.0, with_mask=False):
     """與 backtest() 規則完全相同的快速版。回傳 (每日資金曲線 ndarray 起始=1, 交易 [(出場索引, 報酬)], 持倉比例)"""
     o, c, atr = df["Open"].values, df["Close"].values, df["ATR"].values
     b = lambda col: df[col].fillna(False).values.astype(bool)
@@ -535,6 +535,7 @@ def fast_backtest(df, strategy, cost=0.001, atr_init=2.0, atr_trail=3.0):
     eq = np.empty(n)
     cash, sh, pend, basis, stop, inpos = 1.0, 0.0, 0, 0.0, np.nan, 0
     trades = []
+    mask = np.zeros(n, dtype=bool)
     for i in range(n):
         if pend == 1 and sh == 0:
             basis, sh, cash = cash, cash * (1 - cost) / o[i], 0.0
@@ -547,6 +548,7 @@ def fast_backtest(df, strategy, cost=0.001, atr_init=2.0, atr_trail=3.0):
         pend = 0
         eq[i] = cash + sh * c[i]
         inpos += sh > 0
+        mask[i] = sh > 0
         if strategy == "BH":
             if i == 0:
                 pend = 1
@@ -573,6 +575,8 @@ def fast_backtest(df, strategy, cost=0.001, atr_init=2.0, atr_trail=3.0):
             stop = max(stop, c[i] - atr_trail * atr[i])
             if c[i] < stop or (strategy == "C" and md[i]):
                 pend = -1
+    if with_mask:
+        return eq, trades, inpos / n, mask
     return eq, trades, inpos / n
 
 
@@ -588,6 +592,25 @@ def seg_stats(eq, idx, lo, hi):
     cagr = (seg[-1] / seg[0]) ** (1 / yrs) - 1
     mdd = (seg / np.maximum.accumulate(seg) - 1).min()
     return cagr * 100, mdd * 100, cagr / max(abs(mdd), 0.05)
+
+
+def seg_alpha(s, k, lo, hi):
+    """擇時優勢 (%/年) = 策略報酬 − 持倉時間比例 × 買進持有報酬。
+    衡量「同樣只持股這麼多時間，挑的時機是否比隨便抱更好」。"""
+    idx = s["idx"]
+    m = (idx >= lo) & (idx < hi)
+    if m.sum() < 20 or k == "BH":
+        return 0.0 if m.sum() >= 20 else np.nan
+    pos = np.flatnonzero(m)
+    p0 = pos[0] - 1 if pos[0] > 0 else pos[0]
+
+    def ret(eq):
+        return eq[pos[-1]] / eq[p0] - 1
+
+    eq, _, _, mask = s["res"][k]
+    eqb = s["res"]["BH"][0]
+    yrs = max((idx[pos[-1]] - idx[pos[0]]).days / 365.25, 1 / 12)
+    return (ret(eq) - mask[pos].mean() * ret(eqb)) / yrs * 100
 
 
 def stock_features(d):
@@ -616,6 +639,9 @@ def lab_page(st, yf):
         start_year = st.number_input("回測起始年", 2012, 2024, 2018, 1)
         train_y = st.number_input("訓練期 (年)", 2, 5, 3, 1)
         method = st.radio("分群方式", ["依股性 (波動×趨勢)", "依產業"])
+        eval_mode = st.radio("評估方式", ["短線擇時 (推薦)", "整體報酬 (和長抱比 MAR)"],
+                             help="短線擇時: 看策略挑的進出場時機，是否比「同樣持股時間的隨便抱」更好。"
+                                  "整體報酬: 直接和一路抱著比，長期多頭時短線幾乎都會輸。")
         strats = st.multiselect("參與比較的策略", LAB_STRATS, LAB_STRATS, format_func=lambda k: LAB_NAME[k])
         cost = st.number_input("單邊成本 %", 0.0, 1.0, 0.10, 0.05) / 100
         st.markdown("**策略參數**")
@@ -637,14 +663,20 @@ def lab_page(st, yf):
 **2. 滾動驗證**：例如訓練期 3 年，就用 {start_year}–{start_year + train_y - 1} 年挑出群組裡 MAR 中位數最高的策略，
 拿到 {start_year + train_y} 年實測；再往前滾一年，直到今年。實測年份的結果完全沒有參與挑選，才是真正的樣本外。
 
-**3. 用 MAR 比較**：MAR = 年化報酬 ÷ 最大回撤（回撤小於 5% 時以 5% 計），同時考慮賺多少和過程多痛。
+**3. 兩種評估方式**：
+- **短線擇時（推薦）**：擇時優勢 = 策略報酬 − 持倉時間比例 × 買進持有報酬。例如策略只有 30% 時間持股、賺 12%，
+同期買進持有賺 30%，隨便抱 30% 的時間期望賺 9%，擇時優勢就是 +3%。這衡量的是「進出場時機挑得好不好」，
+空手的時間資金可以拿去做別檔，所以不該因為沒有一直持股就被扣分。
+- **整體報酬**：用 MAR 直接和一路抱著比。在長期多頭裡，短線策略幾乎都會輸，適合用來判斷「這檔該不該長抱」。
+
+**MAR 說明**：MAR = 年化報酬 ÷ 最大回撤（回撤小於 5% 時以 5% 計），同時考慮賺多少和過程多痛。
 買進持有也一起比，短線策略贏不過它的群組會標為「長抱型」。
 
 **4. 判定 ✅ 需要全部通過**：
 - 滾動驗證中，同一個策略被選中的比例 ≥ 門檻（代表穩定，不是每年換一個）
-- 這個策略在全部樣本外年份的 MAR 中位數 > 0，而且高於買進持有
+- 樣本外的擇時優勢 > 0 且報酬 > 0（短線擇時模式）；或 MAR > 0 且高於買進持有（整體報酬模式）
 - 群組樣本外總交易次數夠多、獲利因子夠高
-- 參數穩定：把參數往兩邊調整後，樣本外 MAR 仍為正，且不低於原本的一半
+- 參數穩定：把參數往兩邊調整後，樣本外分數仍為正，且不低於原本的一半
 
 **5. 個股檢查**：個股沿用群組策略，但個股自己的樣本外 MAR 若 ≤ 0，標為「個股失效」不交易。
 """)
@@ -699,7 +731,7 @@ def lab_page(st, yf):
                 d = d[d.index >= start]
                 if len(d) < 252 * (train_y + 1):
                     continue
-                res = {k: fast_backtest(d, k, cost, atr_init, atr_trail) for k in strats}
+                res = {k: fast_backtest(d, k, cost, atr_init, atr_trail, with_mask=True) for k in strats}
                 stocks[t] = {"idx": d.index, "res": res, "raw": raw,
                              "group": group_of(vol, above, sectors.get(t), method),
                              "vol": vol, "above": above}
@@ -715,32 +747,46 @@ def lab_page(st, yf):
 
         def per_stock_oos(t, k, res=None):
             s = stocks[t]
-            eq, tr, _ = (res or s["res"])[k]
+            eq, tr = (res or s["res"])[k][:2]
             cagr, mdd, mar = seg_stats(eq, s["idx"], oos_lo, oos_hi)
             ot = [r for i, r in tr if s["idx"][i] >= oos_lo]
             return cagr, mdd, mar, ot
 
+        timing = eval_mode.startswith("短線")
+        cand = [k for k in strats if k != "BH"] if timing else strats
         groups = {}
         for t, s in stocks.items():
             groups.setdefault(s["group"], []).append(t)
 
+        def med(vals):
+            vals = [v for v in vals if v == v]
+            return float(np.median(vals)) if vals else np.nan
+
         group_rows, stock_rows, details = [], [], {}
         for g, members in sorted(groups.items()):
-            # 滾動驗證
             hist, picks = [], []
             for y in test_years:
                 tr_lo, tr_hi = pd.Timestamp(f"{y - train_y}-01-01"), pd.Timestamp(f"{y}-01-01")
                 te_lo, te_hi = tr_hi, pd.Timestamp(f"{y + 1}-01-01")
-                score = {k: np.nanmedian([seg_stats(stocks[t]["res"][k][0], stocks[t]["idx"], tr_lo, tr_hi)[2]
-                                          for t in members]) for k in strats}
+                if timing:
+                    score = {k: med([seg_alpha(stocks[t], k, tr_lo, tr_hi) for t in members]) for k in cand}
+                else:
+                    score = {k: med([seg_stats(stocks[t]["res"][k][0], stocks[t]["idx"], tr_lo, tr_hi)[2]
+                                     for t in members]) for k in cand}
                 best = max(score, key=lambda k: -np.inf if np.isnan(score[k]) else score[k])
+                if timing and not score[best] > 0:
+                    best = "NONE"
                 picks.append(best)
-                te = lambda k: np.nanmedian([seg_stats(stocks[t]["res"][k][0], stocks[t]["idx"], te_lo, te_hi)[0]
-                                             for t in members])
-                hist.append({"測試年": f"{y}{' (至今)' if y == last_year else ''}", "訓練期最佳": LAB_NAME[best],
-                             "訓練期 MAR": round(score[best], 2), "當年報酬%(中位數)": round(te(best), 1),
-                             "買進持有當年%": round(te("BH"), 1)})
-            # 各策略樣本外總表
+                te = lambda k: med([seg_stats(stocks[t]["res"][k][0], stocks[t]["idx"], te_lo, te_hi)[0]
+                                    for t in members])
+                row = {"測試年": f"{y}{' (至今)' if y == last_year else ''}", "訓練期最佳": LAB_NAME[best],
+                       "訓練期分數": round(score.get(best, np.nan), 2) if best != "NONE" else None,
+                       "當年報酬%(中位數)": round(te(best), 1) if best != "NONE" else 0.0,
+                       "買進持有當年%": round(te("BH"), 1)}
+                if timing and best != "NONE":
+                    row["當年擇時優勢%"] = round(med([seg_alpha(stocks[t], best, te_lo, te_hi) for t in members]), 1)
+                hist.append(row)
+
             comp = {}
             for k in strats:
                 vals = [per_stock_oos(t, k) for t in members]
@@ -748,31 +794,40 @@ def lab_page(st, yf):
                 wins = sum(r for r in trades if r > 0)
                 loss = abs(sum(r for r in trades if r <= 0))
                 comp[k] = {"策略": LAB_NAME[k],
-                           "年化%(中位數)": np.nanmedian([v[0] for v in vals]),
-                           "最大回撤%(中位數)": np.nanmedian([v[1] for v in vals]),
-                           "MAR(中位數)": np.nanmedian([v[2] for v in vals]),
+                           "年化%(中位數)": med([v[0] for v in vals]),
+                           "最大回撤%(中位數)": med([v[1] for v in vals]),
+                           "MAR(中位數)": med([v[2] for v in vals]),
+                           "擇時優勢%/年(中位數)": med([seg_alpha(stocks[t], k, oos_lo, oos_hi) for t in members]),
                            "持倉%": np.mean([stocks[t]["res"][k][2] for t in members]) * 100,
                            "總交易": len(trades) if k != "BH" else 0,
                            "獲利因子": (wins / loss if loss else 99.0) if k != "BH" else np.nan}
-            # 判定
+
             top = max(set(picks), key=picks.count)
             share = picks.count(top) / len(picks) * 100
             fails, stable = [], "—"
             if top == "BH":
                 verdict, why = "長抱型", "滾動驗證最常選中買進持有"
+            elif top == "NONE":
+                verdict, why = "無擇時優勢", "多數年份沒有任何策略的擇時優勢 > 0"
             else:
                 c_ = comp[top]
+                key = "擇時優勢%/年(中位數)" if timing else "MAR(中位數)"
                 if share < min_share:
                     fails.append(f"被選中比例 {share:.0f}%")
-                if not c_["MAR(中位數)"] > 0:
-                    fails.append("樣本外 MAR ≤ 0")
-                if c_["MAR(中位數)"] <= comp["BH"]["MAR(中位數)"]:
-                    fails.append("樣本外 MAR 不如買進持有")
+                if timing:
+                    if not c_[key] > 0:
+                        fails.append("樣本外擇時優勢 ≤ 0")
+                    if not c_["年化%(中位數)"] > 0:
+                        fails.append("樣本外報酬 ≤ 0")
+                else:
+                    if not c_[key] > 0:
+                        fails.append("樣本外 MAR ≤ 0")
+                    if c_[key] <= comp["BH"][key]:
+                        fails.append("樣本外 MAR 不如買進持有")
                 if c_["總交易"] < min_trades:
                     fails.append(f"交易只有 {c_['總交易']} 筆")
                 if c_["獲利因子"] < min_pf:
                     fails.append(f"獲利因子 {c_['獲利因子']:.2f}")
-                # 參數穩定度
                 if top in ("C", "D", "V") and not fails:
                     if top == "D":
                         nbs = [(max(1, confirm_n - 2), vol_mult, atr_init, atr_trail),
@@ -780,40 +835,52 @@ def lab_page(st, yf):
                     else:
                         nbs = [(confirm_n, vol_mult, atr_init, max(1.0, atr_trail - 1)),
                                (confirm_n, vol_mult, atr_init, atr_trail + 1)]
-                    base_mar, nb_mars = c_["MAR(中位數)"], []
+                    base_v, nb_vals = c_[key], []
                     for cn, vm, ai, at in nbs:
-                        ms = []
+                        vs = []
                         for t in members:
                             s = stocks[t]
                             dd = add_indicators(s["raw"].copy(), confirm_n=cn, vol_mult=vm)
                             dd = dd[dd.index >= start]
-                            eq, _, _ = fast_backtest(dd, top, cost, ai, at)
-                            ms.append(seg_stats(eq, dd.index, oos_lo, oos_hi)[2])
-                        nb_mars.append(np.nanmedian(ms))
-                    ok = all(m > 0 and m >= 0.5 * base_mar for m in nb_mars)
+                            r_ = fast_backtest(dd, top, cost, ai, at, with_mask=True)
+                            if timing:
+                                tmp = {"idx": dd.index, "res": {top: r_, "BH": s["res"]["BH"]}}
+                                vs.append(seg_alpha(tmp, top, oos_lo, oos_hi) if len(dd) == len(s["idx"]) else np.nan)
+                            else:
+                                vs.append(seg_stats(r_[0], dd.index, oos_lo, oos_hi)[2])
+                        nb_vals.append(med(vs))
+                    ok = all(v > 0 and v >= 0.5 * base_v for v in nb_vals)
                     stable = "穩定" if ok else "參數敏感"
                     if not ok:
-                        fails.append("參數敏感 (" + " / ".join(f"{m:.2f}" for m in nb_mars) + ")")
+                        fails.append("參數敏感 (" + " / ".join(f"{v:.2f}" for v in nb_vals) + ")")
                 elif top in ("A", "B"):
                     stable = "無參數"
                 verdict = "✅" if not fails else ("不穩定" if share < min_share else "△")
                 why = "全部通過" if not fails else "；".join(fails)
+            ct = comp.get(top, {})
             group_rows.append({"群組": g, "檔數": len(members), "推薦策略": LAB_NAME[top], "判定": verdict,
-                               "被選中比例%": round(share), "策略MAR": round(comp[top]["MAR(中位數)"], 2),
-                               "買進持有MAR": round(comp["BH"]["MAR(中位數)"], 2), "參數穩定": stable, "說明": why})
+                               "被選中比例%": round(share),
+                               "擇時優勢%/年": round(ct.get("擇時優勢%/年(中位數)", np.nan), 1) if ct else None,
+                               "策略年化%": round(ct.get("年化%(中位數)", np.nan), 1) if ct else None,
+                               "策略MAR": round(ct.get("MAR(中位數)", np.nan), 2) if ct else None,
+                               "買進持有MAR": round(comp["BH"]["MAR(中位數)"], 2),
+                               "參數穩定": stable, "說明": why})
             details[g] = (hist, comp)
-            # 個股
             for t in members:
-                cg, mg, rg, ot = per_stock_oos(t, top)
+                k_ = top if top in strats else "BH"
+                cg, mg, rg, ot = per_stock_oos(t, k_)
                 cb, mb, rb, _ = per_stock_oos(t, "BH")
+                al = seg_alpha(stocks[t], k_, oos_lo, oos_hi)
                 if verdict == "✅":
-                    sv = "✅" if rg > 0 else "個股失效"
+                    good = (al > 0 and cg > 0) if timing else rg > 0
+                    sv = "✅" if good else "個股失效"
                 else:
-                    sv = verdict if verdict == "長抱型" else "不交易"
+                    sv = verdict if verdict in ("長抱型", "無擇時優勢") else "不交易"
                 stock_rows.append({"代號": t, "群組": g, "群組策略": LAB_NAME[top], "策略代碼": top, "判定": sv,
-                                   "樣本外年化%": round(cg, 1), "樣本外MAR": round(rg, 2),
-                                   "買進持有年化%": round(cb, 1), "買進持有MAR": round(rb, 2),
-                                   "樣本外交易": len(ot), "年化波動%": round(stocks[t]["vol"], 1),
+                                   "樣本外年化%": round(cg, 1), "擇時優勢%/年": round(al, 1),
+                                   "樣本外MAR": round(rg, 2), "買進持有年化%": round(cb, 1),
+                                   "買進持有MAR": round(rb, 2), "樣本外交易": len(ot),
+                                   "年化波動%": round(stocks[t]["vol"], 1),
                                    "站上MA200%": round(stocks[t]["above"] * 100)})
         prog.empty()
         st.session_state["lab"] = (pd.DataFrame(group_rows), pd.DataFrame(stock_rows), details, test_years)
@@ -827,12 +894,13 @@ def lab_page(st, yf):
         return
 
     st.subheader("群組結論")
-    st.caption(f"樣本外期間：{test_years[0]} 年至今。✅ = 全部關卡通過；△ = 部分未通過；不穩定 = 每年選中的策略不一樣；長抱型 = 短線不如買進持有。")
-    order = {"✅": 0, "△": 1, "不穩定": 2, "長抱型": 3}
+    st.caption(f"樣本外期間：{test_years[0]} 年至今。✅ = 全部關卡通過；△ = 部分未通過；不穩定 = 每年選中的策略不一樣；無擇時優勢 = 進出場時機不比隨便抱好；長抱型 = 短線不如買進持有。")
+    order = {"✅": 0, "△": 1, "不穩定": 2, "無擇時優勢": 3, "長抱型": 4}
     st.dataframe(gdf.sort_values("判定", key=lambda c: c.map(order)), use_container_width=True, hide_index=True)
 
     st.subheader("各群組明細")
     fmt = {"年化%(中位數)": "{:.1f}", "最大回撤%(中位數)": "{:.1f}", "MAR(中位數)": "{:.2f}",
+           "擇時優勢%/年(中位數)": "{:.1f}",
            "持倉%": "{:.0f}", "獲利因子": "{:.2f}"}
     for g in gdf["群組"]:
         hist, comp = details[g]
