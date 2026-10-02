@@ -603,7 +603,7 @@ def main():
     n = len(all_res)
     invested = capital * n
     st.subheader("最終損益加總")
-    st.caption(f"共 {n} 檔股票，每檔起始 ${capital:,.0f}，總投入 ${invested:,.0f}")
+    st.caption(f"共 {n} 檔股票，每檔起始 US\\${capital:,.0f}，總投入 US\\${invested:,.0f}")
     tot = summary.groupby("策略", sort=False).agg(**{"期末資金$": ("期末資金$", "sum"),
                                                      "損益$": ("損益$", "sum"),
                                                      "交易次數": ("交易次數", "sum")})
@@ -611,7 +611,7 @@ def main():
     for col, (name, r) in zip(cols, tot.iterrows()):
         pct = r["損益$"] / invested * 100
         col.metric(name, f"${r['損益$']:,.0f}", f"{pct:+.1f}%")
-        col.caption(f"期末 ${r['期末資金$']:,.0f}｜交易 {int(r['交易次數'])} 次")
+        col.caption(f"期末資金 US\\${r['期末資金$']:,.0f}｜交易 {int(r['交易次數'])} 次")
 
 
 if __name__ == "__main__":
